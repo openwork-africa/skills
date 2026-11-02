@@ -1,0 +1,7 @@
+{
+  "web_search": {
+    "js": "https://openwork.africa/skill/web_search/index.js",
+    "sha256": "08b00b9be44220813989e4c4176cc74d57cd833d5b8e238186f1717e31bd4a23",
+    "description": "Search the web for current facts, news, places, people and anything else not in what you know. Give a short query, as you would type it into a search engine. It returns the passages that best match, each with the page it is from, and the sources."
+  }
+}

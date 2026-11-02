@@ -1,0 +1,65 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-skills
+  cancel-in-progress: false
+
+jobs:
+  check:
+    uses: ./.github/workflows/ci.yml
+
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bundling
+        id: bundle
+        run: |
+          version="$(date -u +%Y%m%d%H%M%S)-${GITHUB_SHA::7}"
+          printf '{ "repo": "skills", "commit": "%s", "run": "%s" }\n' "$GITHUB_SHA" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" > RELEASE.json
+          tar -czf "$RUNNER_TEMP/release.tgz" RELEASE.json index.json README.md LICENSE */index.js */README.md
+          tar -tzf "$RUNNER_TEMP/release.tgz"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        env:
+          DEPLOYER_URL: ${{ secrets.DEPLOYER_URL }}
+          DEPLOYER_TOKEN: ${{ secrets.DEPLOYER_TOKEN }}
+        run: |
+          code="$(curl --silent --show-error --max-time 120 -o upload.json -w '%{http_code}' -X PUT \
+            -H "authorization: Bearer $DEPLOYER_TOKEN" -H "content-type: application/gzip" \
+            --data-binary "@$RUNNER_TEMP/release.tgz" \
+            "$DEPLOYER_URL/repos/skills/releases/${{ steps.bundle.outputs.version }}")"
+          cat upload.json; echo
+          [ "$code" = "201" ] || { echo "::error::the release was not uploaded (HTTP $code)"; exit 1; }
+
+      - name: Deploy
+        env:
+          DEPLOYER_URL: ${{ secrets.DEPLOYER_URL }}
+          DEPLOYER_TOKEN: ${{ secrets.DEPLOYER_TOKEN }}
+        run: |
+          code="$(curl --silent --show-error --max-time 120 -o deploy.json -w '%{http_code}' -X POST \
+            -H "authorization: Bearer $DEPLOYER_TOKEN" -H "content-type: application/json" \
+            -d '{ "version": "${{ steps.bundle.outputs.version }}" }' \
+            "$DEPLOYER_URL/repos/skills/activate")"
+          jq -r '"outcome: \(.outcome // .error)"' deploy.json
+          [ "$code" = "200" ] || { echo "::error::the release did not go live (HTTP $code)"; exit 1; }
+
+      - name: Verification
+        run: |
+          sleep 2
+          for name in $(jq -r 'keys[]' index.json); do
+            served="$(curl -fsS "https://openwork.africa/skill/$name/index.js" | sha256sum | cut -d ' ' -f 1)"
+            want="$(jq -r --arg name "$name" '.[$name].sha256' index.json)"
+            [ "$served" = "$want" ] || { echo "::error::$name is served with sha256 $served, not $want"; exit 1; }
+            echo "$name served at sha256 $served"
+          done
