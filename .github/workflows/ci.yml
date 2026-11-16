@@ -17,4 +17,4 @@ jobs:
       - name: Load each skill and check index.json
         run: deno run --allow-read=. --allow-run=deno scripts/build-index.js --check
       - name: Test
-        run: deno test --allow-env tests/
+        run: deno test --allow-env --allow-net=127.0.0.1 tests/
