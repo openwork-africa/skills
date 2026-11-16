@@ -1,32 +1,77 @@
-import { assert, assertEquals } from "jsr:@std/assert@1";
-import search, { cut, focus, rank, skill, words } from "../web_search/index.js";
+import { assert, assertEquals, assertRejects } from "jsr:@std/assert@1";
+import search, { skill } from "../web_search/index.js";
 
-Deno.test("text is cut into passages of about 600 characters along sentence breaks", () => {
-  const sentence = "The quick brown fox jumps over the lazy dog again. ";
-  const parts = cut(sentence.repeat(40));
-  assert(parts.length > 1);
-  assert(parts.every((part) => part.length <= 600 && part.endsWith(".")));
-  assertEquals(parts.join(" ").replace(/\s+/g, " "), sentence.repeat(40).trim().replace(/\s+/g, " "));
+async function withEnv(url, run) {
+  const before = process.env.WEB_URL;
+  if (url === undefined) delete process.env.WEB_URL;
+  else process.env.WEB_URL = url;
+  try {
+    return await run();
+  } finally {
+    if (before === undefined) delete process.env.WEB_URL;
+    else process.env.WEB_URL = before;
+  }
+}
+
+async function withStub(handler, run) {
+  const requests = [];
+  const server = Deno.serve({ hostname: "127.0.0.1", port: 0, onListen() {} }, (request) => {
+    requests.push(new URL(request.url));
+    return handler(request);
+  });
+  try {
+    return await withEnv(`http://127.0.0.1:${server.addr.port}/`, () => run(requests));
+  } finally {
+    await server.shutdown();
+  }
+}
+
+Deno.test("the skill is named web_search and requires a query", () => {
+  assertEquals(skill.name, "web_search");
+  assertEquals(skill.input.required, ["query"]);
+  assertEquals(skill.env, ["WEB_URL"]);
 });
 
-Deno.test("passages are ranked by BM25 and only matching ones come back", () => {
-  const passages = [
-    { text: "Bananas grow in warm places.", url: "a", title: "A" },
-    { text: "Maseru is the capital of Lesotho, a kingdom in southern Africa.", url: "b", title: "B" },
-    { text: "Lesotho is surrounded by South Africa.", url: "c", title: "C" },
-  ];
-  assertEquals(rank("capital of Lesotho", passages).map((p) => p.url), ["b", "c"]);
-  assertEquals(words("Searching cities"), ["search", "city"]);
+Deno.test("it throws when WEB_URL is not set", async () => {
+  await withEnv(undefined, async () => {
+    await assertRejects(() => search({ query: "lesotho" }), Error, "WEB_URL is not set");
+  });
 });
 
-Deno.test("the best six passages come back with their sources once each", () => {
-  const text = Array.from({ length: 20 }, (_, i) => `Lesotho fact number ${i} is here and it is long enough to be a passage of its own. `.repeat(6)).join("\n\n");
-  const { passages, sources } = focus("Lesotho fact", [{ title: "Facts", url: "https://example.com/facts", text }, { title: "None", url: "https://x", text: "Nothing." }]);
-  assertEquals(passages.length, 6);
-  assertEquals(sources, [{ url: "https://example.com/facts", title: "Facts" }]);
+Deno.test("it throws when the query is empty", async () => {
+  await withEnv("http://127.0.0.1:1", async () => {
+    await assertRejects(() => search({ query: "   " }), Error, "give a query");
+    await assertRejects(() => search({}), Error, "give a query");
+  });
 });
 
-Deno.test("it declares the hosts and variables it may use", () => {
-  assertEquals(skill.net, ["api.tavily.com", "127.0.0.1:48402"]);
-  assertEquals(skill.env, ["TAVILY_URL", "TAVILY_API_KEY"]);
+Deno.test("results come back trimmed to title, url and snippet, limited", async () => {
+  const results = Array.from({ length: 8 }, (_, i) => ({
+    title: ` Title ${i} `,
+    url: `https://example.com/${i}`,
+    snippet: "s".repeat(500),
+    score: 0.9,
+    raw: "dropped",
+  }));
+  await withStub(() => Response.json({ results }), async (requests) => {
+    const out = await search({ query: "lesotho", limit: 3 });
+    assertEquals(out.results.length, 3);
+    assertEquals(Object.keys(out.results[0]), ["title", "url", "snippet"]);
+    assertEquals(out.results[0].title, "Title 0");
+    assertEquals(out.results[0].snippet.length, 300);
+    assertEquals(requests[0].pathname, "/search");
+    assertEquals(requests[0].searchParams.get("q"), "lesotho");
+    assertEquals(requests[0].searchParams.get("limit"), "3");
+    assertEquals((await search({ query: "lesotho" })).results.length, 6);
+  });
 });
+
+Deno.test("a 500 throws an error that does not include the body", async () => {
+  await withStub(() => new Response("secret upstream detail", { status: 500 }), async () => {
+    const error = await assertRejects(() => search({ query: "lesotho" }), Error, "500");
+    assert(!error.message.includes("secret upstream detail"));
+  });
+});
+
+// The timeout path is not tested: the 25 second limit is a constant in the skill
+// and cannot be shortened without changing the module.
